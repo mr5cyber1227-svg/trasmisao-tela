@@ -76,7 +76,7 @@ if (code) {
 
 function host() {
   const pcs = new Map();
-  let ws, stream;
+  let ws, stream, queue = Promise.resolve();
   setStatus('Pronto para transmitir');
   $('share').style.display = '';
   $('share').onclick = async () => {
@@ -87,28 +87,31 @@ function host() {
     $('share').style.display = 'none'; $('stop').style.display = '';
     stream.getVideoTracks()[0].onended = stop;
     ws = new WebSocket(wsUrl('host'));
-    ws.onmessage = async (e) => {
+    ws.onmessage = (e) => {
       const msg = JSON.parse(e.data);
-      if (msg.type === 'error') { setStatus('Esse código de sala já está em uso', true); return stop(); }
-      if (msg.type === 'viewer-joined') {
-        const pc = new RTCPeerConnection(ICE);
-        pcs.set(msg.id, pc);
-        stream.getTracks().forEach((t) => pc.addTrack(t, stream));
-        pc.onicecandidate = (ev) => ev.candidate && ws.send(JSON.stringify({ type: 'signal', to: msg.id, data: { candidate: ev.candidate } }));
-        await pc.setLocalDescription(await pc.createOffer());
-        ws.send(JSON.stringify({ type: 'signal', to: msg.id, data: { sdp: pc.localDescription } }));
-        setStatus(`Transmitindo para ${pcs.size} pessoa(s)`);
-      } else if (msg.type === 'signal') {
-        const pc = pcs.get(msg.from); if (!pc) return;
-        if (msg.data.sdp) await pc.setRemoteDescription(msg.data.sdp);
-        if (msg.data.candidate) await pc.addIceCandidate(msg.data.candidate);
-      } else if (msg.type === 'viewer-left') {
-        pcs.get(msg.id)?.close(); pcs.delete(msg.id);
-        setStatus(`Transmitindo para ${pcs.size} pessoa(s)`);
-      }
+      queue = queue.then(() => onMsg(msg)).catch(console.error);
     };
     setStatus('Transmitindo. Envie o link para quem vai assistir.');
   };
+  async function onMsg(msg) {
+    if (msg.type === 'error') { setStatus('Esse código de sala já está em uso', true); return stop(); }
+    if (msg.type === 'viewer-joined') {
+      const pc = new RTCPeerConnection(ICE);
+      pcs.set(msg.id, pc);
+      stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+      pc.onicecandidate = (ev) => ev.candidate && ws.send(JSON.stringify({ type: 'signal', to: msg.id, data: { candidate: ev.candidate } }));
+      await pc.setLocalDescription(await pc.createOffer());
+      ws.send(JSON.stringify({ type: 'signal', to: msg.id, data: { sdp: pc.localDescription } }));
+      setStatus(`Transmitindo para ${pcs.size} pessoa(s)`);
+    } else if (msg.type === 'signal') {
+      const pc = pcs.get(msg.from); if (!pc) return;
+      if (msg.data.sdp) await pc.setRemoteDescription(msg.data.sdp);
+      if (msg.data.candidate) await pc.addIceCandidate(msg.data.candidate);
+    } else if (msg.type === 'viewer-left') {
+      pcs.get(msg.id)?.close(); pcs.delete(msg.id);
+      setStatus(`Transmitindo para ${pcs.size} pessoa(s)`);
+    }
+  }
   function stop() {
     stream?.getTracks().forEach((t) => t.stop());
     pcs.forEach((pc) => pc.close()); pcs.clear();
@@ -121,28 +124,46 @@ function host() {
 }
 
 function viewer() {
-  const ws = new WebSocket(wsUrl('viewer'));
-  let pc;
-  ws.onmessage = async (e) => {
-    const msg = JSON.parse(e.data);
-    if (msg.type === 'not-found') setStatus('Sala não encontrada ou a transmissão ainda não começou', true);
-    else if (msg.type === 'ended') setStatus('A transmissão foi encerrada', true);
-    else if (msg.type === 'signal') {
-      if (!pc) {
-        pc = new RTCPeerConnection(ICE);
-        pc.ontrack = (ev) => { $('video').srcObject = ev.streams[0]; setStatus('Assistindo'); };
-        pc.onicecandidate = (ev) => ev.candidate && ws.send(JSON.stringify({ type: 'signal', data: { candidate: ev.candidate } }));
-      }
-      if (msg.data.sdp) {
-        await pc.setRemoteDescription(msg.data.sdp);
-        await pc.setLocalDescription(await pc.createAnswer());
-        ws.send(JSON.stringify({ type: 'signal', data: { sdp: pc.localDescription } }));
-      }
-      if (msg.data.candidate) await pc.addIceCandidate(msg.data.candidate);
+  const video = $('video');
+  video.muted = true; // navegadores só liberam o autoplay sem som
+  let ws, pc, ended = false, queue = Promise.resolve();
+
+  async function onMsg(msg) {
+    if (msg.type === 'not-found') return setStatus('Aguardando o anfitrião iniciar a transmissão…');
+    if (msg.type === 'ended') { ended = true; return setStatus('A transmissão foi encerrada', true); }
+    if (msg.type !== 'signal') return;
+    if (!pc) {
+      pc = new RTCPeerConnection(ICE);
+      pc.ontrack = (ev) => {
+        video.srcObject = ev.streams[0];
+        video.play().catch(() => {});
+        setStatus('Assistindo. Clique no vídeo para ativar o som.');
+      };
+      pc.onicecandidate = (ev) => ev.candidate && ws.send(JSON.stringify({ type: 'signal', data: { candidate: ev.candidate } }));
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === 'failed') setStatus('Não foi possível conectar. A rede pode estar bloqueando.', true);
+      };
     }
-  };
-  ws.onopen = () => setStatus('Aguardando a transmissão…');
-  $('video').addEventListener('click', () => ($('video').muted = false));
+    if (msg.data.sdp) {
+      await pc.setRemoteDescription(msg.data.sdp);
+      await pc.setLocalDescription(await pc.createAnswer());
+      ws.send(JSON.stringify({ type: 'signal', data: { sdp: pc.localDescription } }));
+    }
+    if (msg.data.candidate) await pc.addIceCandidate(msg.data.candidate);
+  }
+
+  function connect() {
+    pc?.close(); pc = null;
+    ws = new WebSocket(wsUrl('viewer'));
+    ws.onopen = () => setStatus('Conectando à sala…');
+    ws.onmessage = (e) => {
+      const msg = JSON.parse(e.data);
+      queue = queue.then(() => onMsg(msg)).catch(console.error);
+    };
+    ws.onclose = () => { if (!ended && !video.srcObject) setTimeout(connect, 3000); };
+  }
+  connect();
+  video.addEventListener('click', () => { video.muted = false; video.play(); });
 }
 </script>
 </body>
