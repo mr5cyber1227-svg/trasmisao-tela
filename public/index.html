@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#060d11">
+<title>Compartilhe sua tela</title>
+<style>
+:root{--bg:#060d11;--panel:#0e1a21;--line:#1d2f39;--text:#e6eef2;--muted:#8aa0ab;--accent:#5ad1c0;--danger:#ff7a7a}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--text);font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;display:flex;flex-direction:column;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+header{padding:20px 24px;font-weight:600;letter-spacing:.2px}
+main{flex:1;display:flex;align-items:center;justify-content:center;padding:24px}
+.card{width:100%;max-width:520px;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:32px}
+h1{font-size:28px;line-height:1.2;margin:0 0 8px}
+p{color:var(--muted);margin:0 0 24px;max-width:60ch}
+button,.btn{background:var(--accent);color:#04201c;border:0;border-radius:8px;padding:12px 20px;font:inherit;font-weight:600;cursor:pointer}
+button.ghost{background:transparent;color:var(--text);border:1px solid var(--line)}
+button:focus-visible{outline:2px solid #fff;outline-offset:2px}
+.row{display:flex;gap:8px;flex-wrap:wrap}
+input{flex:1;min-width:0;background:var(--bg);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:12px;font:inherit}
+#stage{display:none;width:100%;height:100%;flex-direction:column;gap:12px;padding:0 16px 16px}
+video{width:100%;flex:1;min-height:0;background:#000;border-radius:12px;object-fit:contain}
+.bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;color:var(--muted)}
+.bar .grow{flex:1}
+#status.err{color:var(--danger)}
+</style>
+</head>
+<body>
+<header>Transmissão de tela</header>
+
+<main id="home">
+  <div class="card" id="homeCard">
+    <h1>Compartilhe sua tela</h1>
+    <p>Crie uma sala, envie o link e quem abrir assiste direto no navegador.</p>
+    <div class="row"><button id="create">Criar sala</button></div>
+  </div>
+</main>
+
+<section id="stage">
+  <video id="video" autoplay playsinline></video>
+  <div class="bar">
+    <span id="status">Conectando…</span>
+    <span class="grow"></span>
+    <button class="ghost" id="copy">Copiar link</button>
+    <button id="share" style="display:none">Compartilhar tela</button>
+    <button class="ghost" id="stop" style="display:none">Parar</button>
+  </div>
+</section>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const ICE = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+const m = location.pathname.match(/^\/room\/([A-Za-z0-9-]+)/);
+const code = m && m[1].toUpperCase();
+const isHost = location.hash === '#host';
+const setStatus = (t, err) => { $('status').textContent = t; $('status').className = err ? 'err' : ''; };
+const wsUrl = (role) => `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws?room=${code}&role=${role}`;
+
+$('create').onclick = () => {
+  const c = () => Math.random().toString(36).slice(2, 6).toUpperCase();
+  location.href = `/room/${c()}-${c()}#host`;
+};
+
+if (code) {
+  $('home').style.display = 'none';
+  $('stage').style.display = 'flex';
+  $('copy').onclick = async () => {
+    await navigator.clipboard.writeText(`${location.origin}/room/${code}`);
+    $('copy').textContent = 'Link copiado';
+    setTimeout(() => ($('copy').textContent = 'Copiar link'), 2000);
+  };
+  isHost ? host() : viewer();
+}
+
+function host() {
+  const pcs = new Map();
+  let ws, stream;
+  setStatus('Pronto para transmitir');
+  $('share').style.display = '';
+  $('share').onclick = async () => {
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 30 }, audio: true });
+    } catch { return setStatus('Compartilhamento cancelado', true); }
+    $('video').srcObject = stream; $('video').muted = true;
+    $('share').style.display = 'none'; $('stop').style.display = '';
+    stream.getVideoTracks()[0].onended = stop;
+    ws = new WebSocket(wsUrl('host'));
+    ws.onmessage = async (e) => {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'error') { setStatus('Esse código de sala já está em uso', true); return stop(); }
+      if (msg.type === 'viewer-joined') {
+        const pc = new RTCPeerConnection(ICE);
+        pcs.set(msg.id, pc);
+        stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+        pc.onicecandidate = (ev) => ev.candidate && ws.send(JSON.stringify({ type: 'signal', to: msg.id, data: { candidate: ev.candidate } }));
+        await pc.setLocalDescription(await pc.createOffer());
+        ws.send(JSON.stringify({ type: 'signal', to: msg.id, data: { sdp: pc.localDescription } }));
+        setStatus(`Transmitindo para ${pcs.size} pessoa(s)`);
+      } else if (msg.type === 'signal') {
+        const pc = pcs.get(msg.from); if (!pc) return;
+        if (msg.data.sdp) await pc.setRemoteDescription(msg.data.sdp);
+        if (msg.data.candidate) await pc.addIceCandidate(msg.data.candidate);
+      } else if (msg.type === 'viewer-left') {
+        pcs.get(msg.id)?.close(); pcs.delete(msg.id);
+        setStatus(`Transmitindo para ${pcs.size} pessoa(s)`);
+      }
+    };
+    setStatus('Transmitindo. Envie o link para quem vai assistir.');
+  };
+  function stop() {
+    stream?.getTracks().forEach((t) => t.stop());
+    pcs.forEach((pc) => pc.close()); pcs.clear();
+    ws?.close();
+    $('video').srcObject = null;
+    $('stop').style.display = 'none'; $('share').style.display = '';
+    setStatus('Transmissão encerrada');
+  }
+  $('stop').onclick = stop;
+}
+
+function viewer() {
+  const ws = new WebSocket(wsUrl('viewer'));
+  let pc;
+  ws.onmessage = async (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'not-found') setStatus('Sala não encontrada ou a transmissão ainda não começou', true);
+    else if (msg.type === 'ended') setStatus('A transmissão foi encerrada', true);
+    else if (msg.type === 'signal') {
+      if (!pc) {
+        pc = new RTCPeerConnection(ICE);
+        pc.ontrack = (ev) => { $('video').srcObject = ev.streams[0]; setStatus('Assistindo'); };
+        pc.onicecandidate = (ev) => ev.candidate && ws.send(JSON.stringify({ type: 'signal', data: { candidate: ev.candidate } }));
+      }
+      if (msg.data.sdp) {
+        await pc.setRemoteDescription(msg.data.sdp);
+        await pc.setLocalDescription(await pc.createAnswer());
+        ws.send(JSON.stringify({ type: 'signal', data: { sdp: pc.localDescription } }));
+      }
+      if (msg.data.candidate) await pc.addIceCandidate(msg.data.candidate);
+    }
+  };
+  ws.onopen = () => setStatus('Aguardando a transmissão…');
+  $('video').addEventListener('click', () => ($('video').muted = false));
+}
+</script>
+</body>
+</html>
